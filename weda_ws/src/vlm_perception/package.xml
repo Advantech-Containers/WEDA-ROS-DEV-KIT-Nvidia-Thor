@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>vlm_perception</name>
+  <version>1.0.0</version>
+  <description>WEDA industrial VLM reference app: scene description + OCR + depth
+    grounding on Jetson Thor (Qwen3-VL via on-board vLLM). Teach-by-example.</description>
+  <maintainer email="samir.singh@advantech.com">Advantech WISE-Edge</maintainer>
+  <license>Apache-2.0</license>
+
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>diagnostic_msgs</depend>
+  <depend>cv_bridge</depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

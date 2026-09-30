@@ -1,0 +1,279 @@
+# ==============================================================================
+# WEDA VLM Perception — THE configuration file
+# ------------------------------------------------------------------------------
+# One file drives BOTH:
+#   * the vLLM server launcher   (vlm-serve / serve_vlm.py)
+#   * the ROS 2 perception node  (vlm-perception / app.py + depth_processor.py)
+#
+# ${VAR} in string values is expanded from the environment — keep secrets
+# (camera credentials, HF_TOKEN) in .env, never in this file.
+# In-container path: /opt/weda-release/config/vlm_app.yaml
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# vLLM server — every Jetson Thor optimization lives HERE, as data.
+# These values are the configuration validated on this exact stack
+# (Qwen3-VL-30B-A3B AWQ, awq_marlin + fp8 KV + FlashInfer + CUDA graphs).
+# ------------------------------------------------------------------------------
+server:
+  model: QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ   # ~17GB download on first start
+  revision: a5ea10732e2c9330957864ece3ec66d806a4b00d  # pin the commit, not the tag:
+                                                    # an unpinned repo reaches every
+                                                    # device on the next pull. Update
+                                                    # this whenever `model:` changes.
+  served_model_name: weda-vlm                       # stable name the client uses
+  host: ${VLM_SERVER_HOST}                          # .env; loopback by default —
+                                                    # both services share the host
+                                                    # network namespace, so the ROS
+                                                    # client reaches it on 127.0.0.1
+  port: 8000
+
+  # --- Memory (Jetson unified-memory rule!) -----------------------------------
+  # On Jetson this is a fraction of TOTAL system RAM (not a discrete VRAM pool),
+  # and vLLM refuses to start if that much RAM is not actually FREE. The
+  # datacenter default (0.9) would starve ROS/CV/OS. 0.30 (~37GB of 122GB) fits
+  # the AWQ model + ample KV cache AND boots even on a busy dev box. On a clean
+  # or dedicated device raise to 0.40-0.45 for more KV headroom -- the engine
+  # prints its KV budget at startup so you can see what you gained.
+  gpu_memory_utilization: 0.30
+
+  # --- Quantization + KV cache --------------------------------------------------
+  quantization: null            # null = AUTO-DETECT from the checkpoint (recommended:
+                                # survives model swaps; vLLM picks awq_marlin for AWQ,
+                                # fp8 for FP8, etc. Only pin when overriding detection.)
+  kv_cache_dtype: fp8           # halves KV memory traffic; validated for Qwen3-VL.
+                                # SWAP NOTE: set 'auto' for other checkpoints — most lack
+                                # kv-scales and fp8 can silently cost accuracy.
+
+  # --- Attention / kernels ------------------------------------------------------
+  attention_backend: flashinfer # Thor-optimized; validated for Qwen3-VL.
+                                # SWAP NOTE: set null to auto-select — explicit flashinfer
+                                # hard-fails on MLA models / unusual head sizes.
+  enforce_eager: false          # false = CUDA graphs ON (~7x decode speed on Jetson).
+                                # Only set true as a debugging escape hatch.
+
+  # --- Context & batching (single-stream edge serving) --------------------------
+  max_model_len: 32768          # image tokens count against this; 32k is generous
+  max_num_seqs: 4               # a couple of overlapped requests, no activation blowup
+  enable_chunked_prefill: true
+  max_num_batched_tokens: 8192  # prefill budget; bigger = faster TTFT for images
+  enable_prefix_caching: true   # our system prompt repeats every cycle — free win
+
+  # --- Multimodal budget (camera frames are unique — tune for that) -------------
+  limit_mm_per_prompt: { image: 2, video: 0 }  # 2 = color + optional depth colormap;
+                                               # video 0 frees encoder+KV budget
+  mm_processor_cache_gb: 0      # frames never repeat; default 4GiB cache is dead weight
+  max_pixels: 1003520           # caps visual tokens/frame (~980). QWEN-FAMILY ONLY:
+                                # other processors silently ignore it (launcher warns);
+                                # frame token cost then follows the model's own logic.
+
+  # --- Speculative decoding (ngram: model-agnostic, zero extra memory) ----------
+  # Drafts token spans by looking them up in the PROMPT (our JSON schema keys
+  # repeat verbatim in every reply) — the model only verifies. No draft network,
+  # so it works with ANY checkpoint you swap in. Set null to disable.
+  # Measured on Thor / Qwen3-VL-30B AWQ: 67 -> 73 tok/s (~34% draft acceptance).
+  # Gains are muted on MoE models (verified tokens route to different experts,
+  # multiplying weight traffic) — DENSE models see substantially more.
+  speculative_config:
+    method: ngram
+    num_speculative_tokens: 3   # draft window; wider wastes verify bandwidth
+                                # (measured per-position acceptance: .54/.43/.36
+                                #  then .22/.14 — positions 4-5 are dead weight)
+    prompt_lookup_max: 5        # longest prompt n-gram to match
+    prompt_lookup_min: 2
+
+  trust_remote_code: true
+  extra_args: []                # escape hatch: raw `vllm serve` flags, appended last
+
+  # Switching model: change `revision:` above in the same edit. Read the commit
+  # off the model's Hugging Face page (Files -> the commit hash), or after a
+  # first pull from the snapshot directory name in the cache. Leaving the old
+  # pin in place fails the load rather than serving the wrong weights.
+  #
+  # --- PRESET: maximum accuracy (official FP8, ~31GB) ---------------------------
+  # model: Qwen/Qwen3-VL-30B-A3B-Instruct-FP8
+  # revision: <commit-sha>
+  # quantization: null
+  # gpu_memory_utilization: 0.50
+  # --- PRESET: small & fast (~5GB download) -------------------------------------
+  # model: SherlockID365/Qwen3-VL-8B-Instruct-quantized.w4a16
+  # revision: <commit-sha>
+  # quantization: null
+
+# ------------------------------------------------------------------------------
+# ROS node → server client hygiene
+# ------------------------------------------------------------------------------
+client:
+  base_url: http://127.0.0.1:8000/v1   # host networking: same box as vlm-server
+  api_key: not-needed                   # vLLM ignores it; openai client requires one
+  connect_timeout_s: 5
+  read_timeout_s: 60
+  temperature: 0.0                      # deterministic perception
+  frequency_penalty: 0.3                # breaks greedy-decode repetition loops
+                                        # (e.g. endless blank OCR items)
+  max_image_edge: 1024                  # resize before base64 JPEG (bandwidth + tokens)
+  jpeg_quality: 85
+
+# ------------------------------------------------------------------------------
+# Color source — used when depth.enabled is false (RGB-only mode).
+# ONE GStreamer pipeline string; MUST end with the appsink contract below
+# (drop=true max-buffers=1 sync=false → latest-frame-wins, zero latency creep).
+# ------------------------------------------------------------------------------
+stream:
+  # Default: synthetic test pattern — works with ZERO hardware attached.
+  gst_pipeline: >-
+    videotestsrc pattern=ball is-live=true !
+    video/x-raw,width=1280,height=720,framerate=15/1 !
+    videoconvert ! video/x-raw,format=BGR !
+    appsink drop=true max-buffers=1 sync=false
+
+  # --- USB camera (V4L2) --------------------------------------------------------
+  # gst_pipeline: >-
+  #   v4l2src device=/dev/video0 !
+  #   video/x-raw,width=1280,height=720,framerate=15/1 !
+  #   videoconvert ! video/x-raw,format=BGR !
+  #   appsink drop=true max-buffers=1 sync=false
+
+  # --- RTSP (industrial IP camera; tcp = no silent UDP loss) --------------------
+  # gst_pipeline: >-
+  #   rtspsrc location=rtsp://${CAM_USER}:${CAM_PASS}@192.168.1.50/stream1
+  #   protocols=tcp latency=150 drop-on-latency=true !
+  #   rtph264depay ! h264parse ! avdec_h264 !
+  #   videoconvert ! video/x-raw,format=BGR !
+  #   appsink drop=true max-buffers=1 sync=false
+
+  # --- Video file (note sync=true: pace playback like a live camera) ------------
+  # gst_pipeline: >-
+  #   filesrc location=/opt/weda-release/samples/demo.mp4 !
+  #   decodebin ! videoconvert ! video/x-raw,format=BGR !
+  #   appsink drop=true max-buffers=1 sync=true
+
+  reconnect_backoff_initial_s: 1.0
+  reconnect_backoff_max_s: 30.0
+
+# ------------------------------------------------------------------------------
+# Perception cycle — editing the prompt IS the customization path.
+# ------------------------------------------------------------------------------
+perception:
+  interval_s: 3         # tick period; with single-flight this means "start the
+                        # next analysis as soon as the previous one finishes"
+                        # (~7-10s effective cycle). Raise to trade freshness
+                        # for GPU idle time / power.
+  max_tokens: 768       # headroom for busy scenes (people + clutter + OCR); the
+                        # parser also repairs truncated replies, but headroom is
+                        # cheaper than repair — normal replies finish well below the cap
+  # NOTE: no "bearing" field — the node derives it from box geometry (free,
+  # model-agnostic) so the model doesn't burn decode tokens re-stating it.
+  # If you swap in a model that cannot return boxes (model_profile box_format:
+  # none), add a bearing field back here — then it's the only spatial signal.
+  prompt: >-
+    You are an industrial perception system. Analyze the image and reply with
+    ONLY a JSON object, no other text, using exactly this schema:
+    {"description": "<at most 2 short sentences: the scene and any ongoing
+    action>", "objects": [{"name": "<object>", "box_2d": [x1, y1, x2, y2],
+    "approx_distance_m": <number or null>}], "actions": ["<ongoing
+    action>"], "visible_text": ["<every piece of readable text, transcribed
+    verbatim>"]}.
+    box_2d coordinates are integers normalized to 0-1000 over the image width
+    and height. List at most the 5 most salient objects. visible_text: at most
+    8 items, only text you can CLEARLY read (verbatim, preserving case); use an
+    empty list if nothing is readable — never repeat items. If depth context is
+    provided, use it to fill approx_distance_m for each object; otherwise null.
+
+# ------------------------------------------------------------------------------
+# Model profile — how to INTERPRET the model's output. This is the per-model
+# adaptation layer: swap `server.model` and, if needed, tune ONLY this block.
+# 'auto' works for most models; nothing here can crash the pipeline — wrong
+# settings degrade to skipped fields, never to wrong measurements.
+# ------------------------------------------------------------------------------
+model_profile:
+  # Bounding-box coordinate convention the model EMITS (training-dependent,
+  # prompts cannot force it):  auto = detect per reply
+  #   qwen_1000 : 0-1000 integers  (Qwen2/2.5/3-VL, GLM-4V)
+  #   norm_01   : 0.0-1.0 floats   (LLaVA family, InternVL-style)
+  #   pixels    : pixel coords of the sent image (some fine-tunes)
+  #   none      : model cannot ground — skip boxes & depth measurement entirely
+  box_format: auto
+  # Strip <think>...</think> blocks before parsing (Cosmos-Reason, R1-style
+  # reasoning VLMs). Safe to leave on: non-reasoning models are unaffected.
+  strip_reasoning: true
+  # Set false for weak-OCR models: removes visible_text from the prompt schema
+  # and payloads — honest absence beats confidently hallucinated text.
+  expect_ocr: true
+
+# ------------------------------------------------------------------------------
+# Depth — Orbbec camera via OrbbecSDK_ROS2 (built in weda_ws, see README).
+# Depth reaches the VLM as a compact TEXT grid appended to the prompt each cycle;
+# the model grounds objects with real distances ("person, ~1.2 m, center-left").
+# ------------------------------------------------------------------------------
+depth:
+  enabled: true
+  color_topic: /camera/color/image_raw
+  depth_topic: /camera/depth_registered/image_raw   # MUST be depth ALIGNED to color
+  camera_info_topic: /camera/color/camera_info
+  depth_scale: 0.001          # Orbbec publishes 16UC1 millimeters → meters
+  min_m: 0.02                 # validity bounds (Orbbec near/far limits) — readings
+  max_m: 10.0                 #   outside are treated as invalid, not as objects
+  grid: [3, 3]                # median distance per cell, sent to the VLM as text
+  near_threshold_m: 1.0       # "% of scene closer than this" stat
+  # Per-object distance MEASUREMENT:
+  # the VLM returns box_2d per object; we sample the aligned depth inside each
+  # box and report the 25th percentile (biased toward the closer surface, so
+  # background pixels inside the box don't inflate the reading). The VLM's own
+  # estimate is kept alongside and cross-checked against the measurement.
+  bbox_percentile: 25
+  distance_tolerance_pct: 15  # |vlm - measured|/measured above this => "mismatch"
+  max_context_age_s: 2.0      # older depth context → reported as stale/unavailable
+  publish_rate_hz: 2.0        # depth_context + colormap publish throttle
+  send_depth_image_to_vlm: false   # true = attach JET colormap as a 2nd image
+  colormap_topic: /vlm/depth_colormap/compressed   # /compressed suffix = image_transport convention (rviz-friendly)
+  context_topic: /vlm/depth_context
+
+# ------------------------------------------------------------------------------
+# Detector — Tier-1 REAL-TIME boxes (BYOL: ultralytics, installed at container
+# start after EULA acceptance). The VLM cannot do 30fps (physics: ~8s/analysis);
+# this tier owns live geometry + per-object depth, the VLM owns meaning.
+# ------------------------------------------------------------------------------
+detector:
+  enabled: true               # idles gracefully if ultralytics is not installed
+  model: /opt/weda_ws/models/yolo26n.engine   # TensorRT FP16 (project standard:
+                              # YOLO26n, never below). Auto-exports from yolo26n.pt
+                              # on first run (~3 min, device-specific) and persists
+                              # in the workspace. Any ultralytics .pt/.engine works.
+  imgsz: 640
+  conf: 0.4
+  classes: []                 # [] = all COCO classes; or e.g. [0] = person only
+  max_fps: 30                 # inference rate cap (measured ~54fps capability)
+  tracker: bytetrack.yaml     # stable track IDs across frames
+  publish_topic: /vlm/detections
+
+# ------------------------------------------------------------------------------
+# Display — which demo windows open (only when a display is available;
+# headless devices skip all of them automatically regardless of these flags).
+# ------------------------------------------------------------------------------
+display:
+  rviz: true          # rviz2 with the bundle preset (color | depth | annotated)
+  rqt_graph: true     # live node/topic graph window
+  viewer: true        # the big annotated live window (vlm-view, q/Esc to close)
+
+# ------------------------------------------------------------------------------
+# Outputs
+# ------------------------------------------------------------------------------
+output:
+  perception_topic: /vlm/perception        # std_msgs/String — full JSON payload
+  description_topic: /vlm/description      # std_msgs/String — human-readable
+  annotated_topic: /vlm/annotated/compressed  # CompressedImage, caption + OCR overlay
+  annotated_jpeg_quality: 80
+
+logging:
+  level: info
+
+# ------------------------------------------------------------------------------
+# BYOL note: commercial packages are NEVER baked into the image. Ultralytics
+# (the detector tier) is handled automatically by the container start after
+# EULA acceptance. For ADDITIONAL commercial packages of your own, set in .env:
+#   WISE_LICENSED_PIP=your-commercial-package
+#   ACCEPT_COMMERCIAL_EULA=true
+# and the container's license gate installs them at startup after acceptance.
+# See README "Extension exercises" #3.
+# ------------------------------------------------------------------------------

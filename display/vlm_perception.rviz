@@ -1,0 +1,50 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+    Property Tree Widget:
+      Expanded: ~
+    Tree Height: 300
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Name: Color (Orbbec)
+      Topic:
+        Value: /camera/color/image_raw
+        Depth: 1
+        Reliability Policy: Best Effort
+      Value: true
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Name: Depth Colormap
+      Topic:
+        Value: /vlm/depth_colormap/compressed
+        Depth: 1
+        Reliability Policy: Best Effort
+      Value: true
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Name: VLM Annotated
+      Topic:
+        Value: /vlm/annotated/compressed
+        Depth: 1
+        Reliability Policy: Best Effort
+      Value: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: camera_link
+    Frame Rate: 15
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Name: Current View
+    Saved: ~
+Window Geometry:
+  Height: 900
+  Width: 1400

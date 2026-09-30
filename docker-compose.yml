@@ -1,0 +1,184 @@
+# ==============================================================================
+# WEDA ROS VLM — Deployment Configuration
+# NVIDIA Jetson AGX Thor (JetPack 7.x)
+# ------------------------------------------------------------------------------
+# Pulls the published image and starts a GPU-enabled ROS 2 + VLM container.
+#
+#   ./build.sh                        # starts and opens a ROS-ready shell
+#
+# Or manually (note: 'exec' shells must source the ROS environment themselves):
+#   docker compose up -d
+#   docker compose exec weda-ros-vlm bash
+#   source /opt/ros/$ROS_DISTRO/setup.bash
+#
+# Overrides (environment):
+#   WEDA_ROS_VLM_IMAGE    full image reference (default from .env: harbor.edgesync.cloud/weda-ai/weda-ros-cv:1.0.0-thor)
+#   ROS_DOMAIN_ID         DDS domain (default 0)
+#   RMW_IMPLEMENTATION    rmw_fastrtps_cpp (default) or rmw_cyclonedds_cpp
+# ==============================================================================
+
+services:
+  weda-ros-vlm:
+    image: ${WEDA_ROS_VLM_IMAGE}
+    # Default: the pre-built image is pulled (or reused from local cache when
+    # already present). To build a custom local image from the release
+    # Dockerfile instead, uncomment the line below:
+    # build: .
+    container_name: ${CONTAINER_NAME:-weda-ros-vlm}
+    restart: unless-stopped
+
+    # --------------------------------------------------------------------------
+    # GPU access (NVIDIA container runtime required)
+    # --------------------------------------------------------------------------
+    runtime: nvidia
+    # Device access without privileged: the /dev bind below makes the nodes
+    # visible, and these rules make them usable. Wildcards keep hotplug
+    # working -- a re-plugged camera gets a new minor number, which a fixed
+    # `devices:` entry would not follow.
+    #   81   V4L2 / UVC video nodes, used by the RGB-only stream: source
+    #   189  USB, how pyorbbecsdk talks to the Orbbec depth camera
+    device_cgroup_rules:
+      - 'c 81:* rmw'
+      - 'c 189:* rmw'
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, utility, compute, video]
+
+    # --------------------------------------------------------------------------
+    # Capability policy: this list is ENFORCED. The container drops every
+    # capability and takes back only what it needs, which is possible because
+    # device access comes from the cgroup rules above rather than from
+    # privileged mode.
+    #
+    # SYS_PTRACE is deliberately absent: it is only useful for inspecting
+    # other processes, and the debug tooling that would want it is opt-in
+    # (WEDA_DEBUG_TOOLS). Add it back alongside that flag if you need to trace
+    # inside the container.
+    # --------------------------------------------------------------------------
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - IPC_LOCK          # pinned shared memory (DDS, CUDA)
+      - SYS_NICE          # real-time thread priorities
+      - NET_RAW           # specialized networking
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    tmpfs:
+      - /tmp:exec,mode=1777
+      - /run:exec,mode=1777
+
+    # --------------------------------------------------------------------------
+    # Networking: host mode is required for zero-configuration DDS discovery
+    # between containers and other machines on the same ROS_DOMAIN_ID.
+    # --------------------------------------------------------------------------
+    network_mode: host
+    ipc: host
+
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
+      - NVIDIA_DRIVER_CAPABILITIES=${NVIDIA_DRIVER_CAPABILITIES:-compute,utility,video,graphics,display}
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
+      - RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
+      # ── X11 / Qt GUI stability (rviz2, rqt) ─────────────────────────────────
+      - DISPLAY=${DISPLAY:-:0}
+      - XAUTHORITY=/tmp/.Xauthority
+      - QT_X11_NO_MITSHM=${QT_X11_NO_MITSHM:-1}
+      - NO_AT_SPI=${NO_AT_SPI:-1}
+      - DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-/dev/null}
+      # ── Debug tooling: off unless asked for ────────────────────────────────
+      # The service has no env_file, so the knob has to be forwarded here or a
+      # value set in .env never reaches the entrypoint.
+      - WEDA_DEBUG_TOOLS=${WEDA_DEBUG_TOOLS:-false}
+      # ── BYOL license gate (both must flow or the gate is a no-op) ───────────
+      - ACCEPT_COMMERCIAL_EULA=${ACCEPT_COMMERCIAL_EULA:-}
+      - WISE_LICENSED_PIP=${WISE_LICENSED_PIP:-}
+
+    volumes:
+      # Device access: cameras (CSI/USB), I2C, serial, GPU nodes
+      - /dev:/dev:rw
+      # X11 forwarding for GUI tools (rviz2, rqt_graph)
+      - ${X11_SOCKET:-/tmp/.X11-unix}:/tmp/.X11-unix:rw
+      - ${XAUTHORITY:-/tmp/.Xauthority}:/tmp/.Xauthority:ro
+      # Your colcon workspace: put ROS packages under ./weda_ws/src on the host
+      - ./weda_ws:/opt/weda_ws:rw
+      # This bundle — read-only inside the container
+      - .:/opt/weda-release:ro
+      # The bundle's entrypoint (the shared base image bakes NONE — the
+      # explicit entrypoint below is REQUIRED, not an override)
+      - ./entrypoint.sh:/usr/local/bin/entrypoint.sh:ro
+
+    working_dir: /opt/weda_ws
+    tty: true
+    stdin_open: true
+    entrypoint: ["/usr/local/bin/entrypoint.sh"]
+    command: /bin/bash
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "${LOG_MAX_SIZE:-50m}"
+        max-file: "${LOG_MAX_FILE:-3}"
+
+  # ============================================================================
+  # vLLM server for the VLM Perception reference app (profile: vlm)
+  #   docker compose --profile vlm up -d vlm-server
+  # Runs the DEDICATED serving image (l3a-llm) — the ROS image deliberately
+  # excludes the vllm serving stack (fastapi/uvicorn) to stay lean; serving and
+  # robotics are separate containers sharing the GPU + localhost (by design).
+  # All model/engine settings come from config/vlm_app.yaml (single source of
+  # truth — see the serve_vlm.py banner). First start downloads ~17GB weights.
+  # ============================================================================
+  vlm-server:
+    image: ${WEDA_VLM_SERVER_IMAGE:-harbor.edgesync.cloud/weda-ai/weda-llm-base:1.0.0-thor}
+    container_name: weda-vlm-server
+    profiles: ["vlm"]
+    restart: unless-stopped
+    runtime: nvidia
+    network_mode: host
+    ipc: host
+    shm_size: "16g"
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+      - HF_TOKEN=${HF_TOKEN:-}
+      # Guarantees the variable exists inside the container: an undefined
+      # ${VAR} survives config interpolation as a literal and the server then
+      # fails to bind. Set VLM_SERVER_HOST=0.0.0.0 in .env to expose the API
+      # beyond this device -- unauthenticated, so put a proxy in front.
+      - VLM_SERVER_HOST=${VLM_SERVER_HOST:-127.0.0.1}
+    volumes:
+      - .:/opt/weda-release:ro
+      # l3a-llm's HF cache lives at /models/huggingface (HF_HOME baked in image)
+      - ${HF_CACHE_DIR:-~/.cache/huggingface}:/models/huggingface:rw
+    # Bypass the image's serve entrypoint: our launcher assembles the command
+    # from the shared YAML instead of L3A_LLM_* env vars.
+    entrypoint: ["python3"]
+    command:
+      - /opt/weda-release/weda_ws/src/vlm_perception/vlm_perception/serve_vlm.py
+      - --config
+      - /opt/weda-release/config/vlm_app.yaml
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8000/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 3600s   # first boot: model download + CUDA graph capture
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"

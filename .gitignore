@@ -1,0 +1,19 @@
+# ── Runtime artifacts & session output — never commit ─────────────────────────
+weda_ws/build/
+weda_ws/install/
+weda_ws/log/
+weda_ws/Log/
+weda_ws/reports/
+weda_ws/.bench/
+weda_ws/*.log
+__pycache__/
+*.pyc
+
+# ── Licensed / runtime-hydrated artifacts — never redistribute ────────────────
+weda_ws/models/
+weda_ws/*.pt
+*.engine
+*.onnx
+
+# ── Development-only files (not part of the release) ──────────────────────────
+dev/
